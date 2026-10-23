@@ -1,6 +1,6 @@
 # Intuition:
 
-**Level 0: Raw TCP (Before net/http Exists)**
+## Level 0: Raw TCP (Before net/http Exists)
 At the bottom, a web server is just a program listening on a TCP port, reading raw ASCII text from a socket, and writing raw ASCII text back. You can write a working web server using only the net package:
 
 ```
@@ -41,7 +41,7 @@ And your browser displays Hello.
 The Problem with Level 0:
 Doing this by hand is miserable. Every time a request comes in, you have to manually slice strings on \r\n to find the URL path, parse headers into a map, calculate the exact byte length for Content-Length, and handle half-sent TCP packets. Furthermore, because there is no concurrency in that loop, if one user has a slow connection, every other user is frozen waiting for conn.Close().
 
-**Level 1: The HTTP Parser & http.Handler**
+## Level 1: The HTTP Parser & http.Handler
 Why it was invented:
 The Go authors wanted to take the exact for loop from Level 0—opening the TCP port, spawning a goroutine per connection (go), parsing the incoming raw text, and formatting the outgoing text—and lock it inside a single function called http.ListenAndServe.
 Once ListenAndServe parses the raw bytes for you, it packages them into two clean tools:
@@ -90,7 +90,7 @@ func (s MyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 ```
 In a real application with 50 routes, each needing 100 lines of database and template code, this single ServeHTTP method turns into a 5,000-line unmaintainable monster.
 
-**Level 2: Splitting the Switch Statement (http.ServeMux)**
+## Level 2: Splitting the Switch Statement (http.ServeMux)
 Why it was invented:
 Instead of stuffing all your application logic inside one giant switch statement, you want each page (/login, /about) to live in its own separate http.Handler, and you want a dedicated lookup table that routes r.URL.Path to the right handler.
 In electronics, a device that takes one input wire and routes the signal to one of many output wires is called a Multiplexer (Mux). So the Go team built a struct called ServeMux that holds a hash map of URL paths to http.Handlers:
@@ -140,7 +140,8 @@ func main() {
 The Problem with Level 2:
 Look at the boilerplate above. Just to write two tiny routes, we had to invent two completely pointless empty structs (type LoginHandler struct{} and type AboutHandler struct{}) solely because mux.Handle() demands something with a .ServeHTTP(w, r) method attached to it.
 If you have 40 routes, creating 40 dummy structs when all you really want is 40 normal functions (func login(w, r), func about(w, r)) is infuriating.
-Level 3: Disguising Functions as Structs (http.HandlerFunc)
+
+## Level 3: Disguising Functions as Structs (http.HandlerFunc)
 Why it was invented:
 We want to write plain functions:
 ```
@@ -192,7 +193,7 @@ func main() {
 The Problem with Level 3:
 Honestly? Almost nothing. This is already rock-solid, explicit Go code. The only tiny annoyance is having to type http.HandlerFunc(...) every single time you register a function on mux.
 
-**Level 4: The Shortcuts (mux.HandleFunc and DefaultServeMux)**
+## Level 4: The Shortcuts (mux.HandleFunc and DefaultServeMux)
 Why it was invented:
 Pure convenience (syntactic sugar) to save keystrokes.
 First, so you don't have to keep typing mux.Handle("/path", http.HandlerFunc(fn)), the Go team added a helper method on ServeMux called HandleFunc that does that exact type-cast for you inside the library:
@@ -228,4 +229,5 @@ Summary of the Evolution
 | Level 2 | http.ServeMux + mux.Handle | Replaces the giant switch r.URL.Path statement with a hash map of URLs to http.Handler structs. |
 | Level 3 | http.HandlerFunc(fn) | Type-casts a normal func(w, r) so it gets a .ServeHTTP method, saving you from making an empty struct for every route. |
 | Level 4 | http.HandleFunc + nil | Syntactic sugar that does the HandlerFunc cast automatically and stores routes in a hidden global DefaultServeMux. |
+
 
