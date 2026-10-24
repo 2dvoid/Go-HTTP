@@ -459,7 +459,216 @@ This is how you build layouts, partials (headers/footers), and reusable componen
 {{end}}
 ```
 
-## Part 3: Putting It All Together (End-to-End Reference)
+## Part 3: Rules and Best Practices
+
+### 1. Lifecycle & Parsing Rules
+
+#### Rule 1: Parse once at startup, never inside an HTTP handler
+
+Parsing reads files, runs the lexer, allocates AST nodes on the heap, and runs the HTML5 context state machine on first execution. Doing this on every HTTP request wastes CPU and disk/memory bandwidth.
+
+- **Bad:** Calling `template.ParseFiles(...)` inside `func handleHome(w http.ResponseWriter, r *http.Request)`.
+- **Good:** Parse all templates once in `main()` (or an initialization function), store the resulting `*template.Template` pointers in a struct or map, and only call `Execute` / `ExecuteTemplate` inside your HTTP handlers.
+
+#### Rule 2: Embed templates into the binary with `//go:embed`
+
+Relying on relative file paths like `"./templates/home.html"` breaks whenever you start your binary from a different working directory (e.g., via `systemd` or a cron job). Use `embed.FS` with `template.ParseFS` so your templates are compiled directly into the Go binary.
+
+```go
+//go:embed templates/*.html
+var templateFS embed.FS
+
+var tmpl = template.Must(template.ParseFS(templateFS, "templates/*.html"))
+```
+
+#### Rule 3: Never mutate a template after its first `Execute`
+
+Once `Execute` runs on a template set, `html/template` rewrites the AST pipelines and marks the internal `nameSpace.escaped = true`.
+
+- Calling `.Parse()`, `.ParseFiles()`, or `.Funcs()` after execution has occurred will either fail with `html/template: cannot Parse after Execute` or introduce data races across concurrent requests.
+- Treat a parsed template set as **strictly immutable** once your server starts accepting traffic.
+
+### 2. HTTP Rendering & Error Handling Rules
+
+#### Rule 4: Always render into a `bytes.Buffer` before writing to `http.ResponseWriter`
+
+The first time `tmpl.Execute(w, data)` writes a single byte to `http.ResponseWriter`, Go implicitly sends `HTTP/1.1 200 OK` and flushes the response headers over the TCP socket. If your template hits an error halfway down the page (e.g., calling a method on a `nil` pointer or a missing struct field), it is too late to send a `500 Internal Server Error`—the client receives a broken, half-rendered HTML page with a `200 OK` status.
+
+Stage the execution in a buffer first, and only copy to the `http.ResponseWriter` if execution succeeds:
+
+```go
+func render(w http.ResponseWriter, tmpl *template.Template, name string, data any) {
+	var buf bytes.Buffer
+
+	// 1. Execute into memory first
+	if err := tmpl.ExecuteTemplate(&buf, name, data); err != nil {
+		// Safe to write a clean 500 error because nothing has hit 'w' yet
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		log.Printf("template execution error (%s): %v", name, err)
+		return
+	}
+
+	// 2. Set headers and flush the completed buffer to the network socket
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = buf.WriteTo(w)
+}
+```
+
+*Note: For high-throughput servers, you can pull `*bytes.Buffer` instances from a `sync.Pool` and `buf.Reset()` them to avoid heap allocations per request.*
+
+### 3. Data Contracts & Type Safety Rules
+
+#### Rule 5: Pass dedicated structs to `Execute`, not `map[string]any`
+
+When you pass `map[string]any` into a template and misspell a key like `{{.UsrName}}`, Go silently renders the literal string `<no value>` into your HTML by default. When you pass a Go `struct`, `reflect` verifies field and method names against the struct definition—if you write `{{.UsrName}}` and that field does not exist on the struct, `Execute()` immediately fails and returns a descriptive error.
+
+```go
+// Bad: Untyped map hides typos and requires guessing what data the template expects
+tmpl.Execute(w, map[string]any{"Title": "Invoices", "Itms": items})
+
+// Good: Self-documenting contract; missing/misspelled fields fail fast
+type InvoiceListView struct {
+	Title string
+	Items []Item
+}
+
+tmpl.Execute(w, InvoiceListView{Title: "Invoices", Items: items})
+```
+
+#### Rule 6: Always set `Option("missingkey=error")`
+
+Even if you primarily use structs, a struct might contain a `map` field. Configure every template set with `.Option("missingkey=error")` before parsing so missing map keys return an error instead of printing `<no value>` into production HTML.
+
+### 4. Layout Composition & Namespace Rules
+
+#### Rule 7: Isolate page templates to prevent `{{define}}` collisions
+
+Every template parsed into the same `Template` instance shares a single flat `map[string]*Template` (`nameSpace.set`). If `home.html` and `about.html` both contain `{{define "content"}}`, calling `template.ParseGlob("pages/*.html")` overwrites `"content"` with whichever file was parsed last.
+
+Use one of two patterns to guarantee isolation:
+
+1. **The `Clone()` Pattern:** Parse `base.html` and shared partials (`nav.html`, `footer.html`) once into a base template. Loop over your page files, call `base.Clone()` for each page, and parse the single page file into its dedicated clone.
+
+2. **The Explicit File Pair Pattern:** For each page, create a fresh template set containing the layout files plus that single page file:
+
+   ```go
+   pages["home"] = template.Must(template.ParseFS(fs, "base.html", "nav.html", "home.html"))
+   pages["about"] = template.Must(template.ParseFS(fs, "base.html", "nav.html", "about.html"))
+   ```
+
+#### Rule 8: Use `ExecuteTemplate` with an explicit entry-point `{{define}}`
+
+Avoid relying on implicit filenames when calling `Execute()`. Instead, wrap your base layout in `{{define "base"}}...{{end}}` and always invoke it explicitly via:
+
+```go
+tmpl.ExecuteTemplate(&buf, "base", data)
+```
+
+This completely eliminates the `template.New("wrong_name").ParseFiles("right_name.html")` empty-template bug.
+
+#### Rule 9: Always pass the cursor (`.`) to `{{template}}` and `{{block}}`
+
+`{{template "nav"}}` passes `nil` into the `"nav"` template. Unless a sub-template is 100% static text, always pass the cursor explicitly:
+
+- Pass the current cursor: `{{template "nav" .}}`
+- Pass a specific sub-struct to narrow scope: `{{template "userBadge" .CurrentUser}}`
+
+### 5. Logic Boundaries & Maintainability Rules
+
+#### Rule 10: Pre-compute complex boolean logic in Go, not in Polish notation
+
+Template conditionals do not have operator precedence or infix syntax. Writing deeply nested prefix expressions inside HTML quickly becomes unreadable.
+
+**Bad (Inside HTML):**
+
+```html
+{{if and (not .User.IsSuspended) (or (eq .User.Role "admin") (and (eq .Invoice.CreatorID .User.ID) (eq .Invoice.Status "DRAFT")))}}
+  <button>Edit Invoice</button>
+{{end}}
+```
+
+**Good (In Go View Struct or Method):**
+
+```go
+func (v InvoiceView) CanEdit() bool {
+	if v.User.IsSuspended {
+		return false
+	}
+	return v.User.Role == "admin" || (v.Invoice.CreatorID == v.User.ID && v.Invoice.Status == "DRAFT")
+}
+```
+
+```html
+{{if .CanEdit}}
+  <button>Edit Invoice</button>
+{{end}}
+```
+
+#### Rule 11: Keep `FuncMap` pure, fast, and stateless
+
+Functions registered via `.Funcs()` should be pure formatting helpers (e.g., formatting timestamps, converting cents/paisa to currency strings, simple math like `add`/`sub`).
+
+- **Never** perform database queries, network calls, or file I/O inside a template function or a method called by a template.
+- Do all data fetching and error handling in your Go handler *before* calling `Execute`.
+
+#### Rule 12: Use `{{range ... else}}` instead of wrapping loops in `{{if}}`
+
+Don't check `{{if .Items}}` just to see if a list is non-empty before looping. `{{range}}` has a built-in `{{else}}` branch that triggers automatically when the slice or map has length `0` or is `nil`:
+
+```html
+{{range .Items}}
+  <li>{{.Name}}</li>
+{{else}}
+  <li>No items found.</li>
+{{end}}
+```
+
+### 6. Security & Context-Escaping Rules
+
+#### Rule 13: Never cast user-controlled strings to `template.HTML` / `template.JS` / `template.URL`
+
+Types like `template.HTML` completely disable the auto-escaper for that value.
+
+- **Safe:** `template.HTML("<span class='badge'>Verified</span>")` (hardcoded constant string in Go source code).
+- **Fatal Vulnerability:** `template.HTML(r.FormValue("bio"))` (raw user input).
+
+#### Rule 14: Keep HTML tags and quotes balanced inside conditional/loop branches
+
+Because `html/template` verifies at compile time that both branches of an `{{if}}...{{else}}...{{end}}` leave the HTML parser in the exact same lexical state, **never open an HTML tag or attribute quote in one branch and close it outside the branch**:
+
+**Bad (Fails escaping state machine or breaks HTML analysis):**
+
+```html
+{{if .IsUrgent}}<div class="urgent">{{else}}<div class="normal">{{end}}
+  <p>{{.Message}}</p>
+</div>
+```
+
+**Good (Change only the attribute value, keeping tags balanced):**
+
+```html
+<div class="{{if .IsUrgent}}urgent{{else}}normal{{end}}">
+  <p>{{.Message}}</p>
+</div>
+```
+
+#### Rule 15: Always quote HTML attributes that contain template actions
+
+While `html/template` can escape unquoted attributes (`<div class={{.Class}}>`), quoting attributes (`<div class="{{.Class}}">`) is cleaner, allows multiple space-separated classes cleanly, and aligns with standard HTML5 linting rules.
+
+#### Rule 16: Pass structured data to `<script>` via direct evaluation, not string concatenation
+
+When passing Go structs or slices to frontend JavaScript inside a `<script>` tag, do **not** wrap the template action in quotes or manually call `json.Marshal` in Go. Let `html/template`'s `stateJS` escaper serialize the Go value directly into a safe JS literal:
+
+```html
+<script>
+  // Good: html/template automatically JSON-encodes .Items and escapes "</script>" sequences
+  const items = {{.Items}};
+</script>
+```
+
+
+## Part 4: Putting It All Together (End-to-End Reference)
 
 Here is a single, self-contained program demonstrating structs, methods, custom `FuncMap`, safe HTML types, pipelines, `range`, `with`, `index`, `eq`, and template composition.
 
